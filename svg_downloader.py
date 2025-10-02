@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse
+import re
 
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 from bs4 import BeautifulSoup
@@ -314,6 +315,38 @@ class SVGDownloader:
                 
         except Exception as e:
             logger.warning(f"Error during scrolling: {e}")
+    
+    def _filter_svg_links(self, svg_links: List[str]) -> List[str]:
+        """Filter out unwanted SVG links like the site's own logo."""
+        filtered_links = []
+        
+        for link in svg_links:
+            # Skip the site's own logo
+            if link.lower().endswith('/logo.svg') or link.lower() == 'logo.svg':
+                logger.info(f"Skipping site logo: {link}")
+                continue
+                
+            filtered_links.append(link)
+        
+        return filtered_links
+    
+    def _has_valid_svgs(self, svg_links: List[str]) -> bool:
+        """Check if the page has valid SVGs (not just the site logo)."""
+        filtered_links = self._filter_svg_links(svg_links)
+        return len(filtered_links) > 0
+    
+    def _build_page_url(self, base_url: str, page_number: int) -> str:
+        """Build URL for a specific page number."""
+        # Remove trailing slash and page number if present
+        base_url = base_url.rstrip('/')
+        
+        # Remove existing page number from URL
+        base_url = re.sub(r'/\d+$', '', base_url)
+        
+        if page_number == 1:
+            return base_url + '/'
+        else:
+            return f"{base_url}/{page_number}"
 
     def download_svg(self, url: str, filename: Optional[str] = None) -> bool:
         """
@@ -334,7 +367,17 @@ class SVGDownloader:
                 if not filename.endswith('.svg'):
                     filename = f"{filename}.svg"
             
+            # Skip downloading logo.svg (site's own logo)
+            if filename.lower() == 'logo.svg':
+                logger.info(f"Skipping site logo: {filename}")
+                return False
+            
             filepath = os.path.join(DOWNLOAD_DIR, filename)
+            
+            # Skip if file already exists
+            if os.path.exists(filepath):
+                logger.info(f"File already exists, skipping: {filename}")
+                return True
             
             # Navigate to the SVG URL
             response = self.page.goto(url)
@@ -361,7 +404,7 @@ class SVGDownloader:
 
     def download_from_collection(self, collection_url: str, max_downloads: Optional[int] = None) -> int:
         """
-        Download all SVGs from a collection page.
+        Download all SVGs from a collection, automatically handling multiple pages.
 
         Args:
             collection_url: The URL of the collection page
@@ -372,33 +415,74 @@ class SVGDownloader:
         """
         logger.info(f"Starting download from collection: {collection_url}")
         
-        # Try both extraction methods
-        svg_links = self.extract_svg_links(collection_url)
+        total_downloaded = 0
+        page_number = 1
+        max_empty_pages = 3  # Stop after 3 consecutive pages with no valid SVGs
+        empty_page_count = 0
         
-        if not svg_links:
-            logger.info("Trying interactive extraction method...")
-            svg_links = self.extract_svg_links_interactive(collection_url)
-        
-        if not svg_links:
-            logger.warning("No SVG links found")
-            return 0
-        
-        # Limit downloads if specified
-        if max_downloads:
-            svg_links = svg_links[:max_downloads]
-        
-        logger.info(f"Attempting to download {len(svg_links)} SVGs...")
-        
-        # Download each SVG
-        successful_downloads = 0
-        for i, svg_url in enumerate(svg_links, 1):
-            logger.info(f"Downloading {i}/{len(svg_links)}: {svg_url}")
+        while True:
+            # Build URL for current page
+            page_url = self._build_page_url(collection_url, page_number)
+            logger.info(f"Processing page {page_number}: {page_url}")
             
-            if self.download_svg(svg_url):
-                successful_downloads += 1
+            # Try both extraction methods
+            svg_links = self.extract_svg_links(page_url)
             
-            # Small delay between downloads
-            time.sleep(0.5)
+            if not svg_links:
+                logger.info("Trying interactive extraction method...")
+                svg_links = self.extract_svg_links_interactive(page_url)
+            
+            # Filter out unwanted links (like logo.svg)
+            filtered_links = self._filter_svg_links(svg_links)
+            
+            # Check if this page has valid SVGs
+            if not filtered_links:
+                empty_page_count += 1
+                logger.info(f"Page {page_number} has no valid SVGs (empty page count: {empty_page_count})")
+                
+                if empty_page_count >= max_empty_pages:
+                    logger.info(f"Stopping after {max_empty_pages} consecutive empty pages")
+                    break
+                    
+                page_number += 1
+                continue
+            else:
+                empty_page_count = 0  # Reset counter when we find valid SVGs
+            
+            logger.info(f"Found {len(filtered_links)} valid SVGs on page {page_number}")
+            
+            # Apply max_downloads limit across all pages
+            remaining_downloads = None
+            if max_downloads is not None:
+                remaining_downloads = max_downloads - total_downloaded
+                if remaining_downloads <= 0:
+                    logger.info(f"Reached maximum download limit of {max_downloads}")
+                    break
+                    
+                if remaining_downloads < len(filtered_links):
+                    filtered_links = filtered_links[:remaining_downloads]
+            
+            # Download SVGs from current page
+            page_downloads = 0
+            for i, svg_url in enumerate(filtered_links, 1):
+                logger.info(f"Downloading page {page_number} - {i}/{len(filtered_links)}: {svg_url}")
+                
+                if self.download_svg(svg_url):
+                    page_downloads += 1
+                    total_downloaded += 1
+                
+                # Small delay between downloads
+                time.sleep(0.5)
+            
+            logger.info(f"Downloaded {page_downloads}/{len(filtered_links)} SVGs from page {page_number}")
+            
+            # Check if we've reached the download limit
+            if max_downloads is not None and total_downloaded >= max_downloads:
+                logger.info(f"Reached maximum download limit of {max_downloads}")
+                break
+            
+            # Move to next page
+            page_number += 1
         
-        logger.info(f"Successfully downloaded {successful_downloads}/{len(svg_links)} SVGs")
-        return successful_downloads
+        logger.info(f"Collection download complete! Successfully downloaded {total_downloaded} SVGs from {page_number - 1} pages")
+        return total_downloaded
